@@ -1,281 +1,259 @@
 import numpy as np
-from numpy.linalg import cholesky, solve
+from numpy.linalg import solve
+import math
 from dataclasses import dataclass
-import matplotlib.pyplot as plt
-
-from ridge_helpers import ar1_cov, pop_ridge, logpdf, pred_mse, mis_specficied_model
 
 
+from ridge_helpers import pop_ridge_target, pop_ridge_source, pred_mse, mis_specficied_model
+from distributions import make_family
+from show_results import present_results
+
+#---------- config ---------------------------------
 @dataclass
 class Cfg:
-    regime: str = "highdim"       # "highdim" or "fixedp"
-    gamma: float = 1.5            # p = ceil(gamma*n) if highdim
-    p_fixed: int = 50            # used if regime="fixedp"
-    n_list: tuple = (1000, 1200)
+    # Simulation regime
+    dimension_regime: str = "highdim"       # "highdim" or "fixedp"
+    gamma: float = 1.5                      # p = ceil(gamma*n) if highdim
+    p_fixed: int = 50                       # used if regime="fixedp"
+    n_list: tuple = (100,200,300,400,500,600,700,800,900,1000)  # training sizes
     R: int = 1000                   # repetitions per n
+    seed: int = 0
+    n_test: int = 1000              # test set size
 
-    specified: str = "well"        # "well" or "mis"
+    # Model params
+    specified: str = "mis"        # "well" or "mis"
     model_style: str = "sparse"       # "sparse" or "dense"
-    sig_shift: int = 5             # shifted coordinates
-    sig_beta: int = 3              # beta* supports
+    sig_beta: int = 5              # beta* supports
+    noise_eps: float = 1.0          # noise level
 
-    rho_S: float = 0            # params for covariate distributions
-    rho_T: float = 0
-    mu_S: float = 2.0
-    mu_T: float = -2.0
-    sigma_eps: float = 1.0        # noise level
+    # Params for covariate distributions
+    sig_shift: int = 10             # shifted coordinates
 
+    family_S: str = "gaussian_AR1"   # source distribution family
+    family_T: str = "gaussian_AR1"   # target distribution family
+    params_S: dict = None            # source distribution params
+    params_T: dict = None            # target distribution params
+    
+    
     # weighting controls
-    use_subset_weights: bool = True
+    use_subset_weights: bool = True # weights computed on only significant and shifted covariates
+    normalize_weights: bool = True
+    # for clipping weights
+    stabilize_weights: bool = False
     tau: float = 0.6              # temper weights: w^tau, tau∈[0,1]
     clip_q: float = 0.95          # clip at quantile
-    normalize_w: bool = True
 
-    # alpha rules
-    alpha_rule: str = "fixed"      # "fixed", "sqrtlog", or "neff"
+    # Regularization params
+    alpha_rule: str = "sqrtlog"      # "fixed", "sqrtlog", or "neff"
     alpha_fixed: float = 1.0
-    c_sqrtlog: float = 0.25       # α = c*sqrt(log p / n)
-    # c_neff: float = 0.8           # α = c*sqrt(log p / n_eff)
+    c_sqrtlog: float = 0.5         # α = c*sqrt(log p / n)
     
-    seed: int = 0
-    n_test: int = 1000              # test set size 
+    # report output
+    out_dir: str = "iw_ridge"
+
+# ---------- utils ----------
+def get_alpha(n,p, cfg: Cfg):
+    if cfg.alpha_rule == "fixed":
+        return cfg.alpha_fixed
+    elif cfg.alpha_rule == "sqrtlog":
+        return cfg.c_sqrtlog * np.sqrt(np.log(p) / n)
+    else:
+        raise ValueError("alpha_rule must be 'fixed' or 'sqrtlog'")
+    
+def treat_weights(w, cfg: Cfg):
+    if cfg.stabilize_weights:
+        # temper and clip
+        if cfg.tau < 1.0:
+            w = w**cfg.tau
+        if cfg.clip_q is not None:
+            cap = np.quantile(w, cfg.clip_q)
+            w = np.minimum(w, cap)
+    if cfg.normalize_weights:
+        w /= (w.mean() + 1e-12)
+    return w
+
+
+
+# ---------- run ----------
 
 def run(cfg: Cfg):
+    # set up
     rng = np.random.default_rng(cfg.seed)
     results = []
+    plot_dists = []
 
-    if cfg.regime == "fixedp":
-        p = cfg.p_fixed
+    fam_S, fam_T = cfg.family_S.lower(), cfg.family_T.lower()
+    params_S = {} if cfg.params_S is None else dict(cfg.params_S)
+    params_T = {} if cfg.params_T is None else dict(cfg.params_T)
 
-        # choose alpha
-        if cfg.alpha_rule == "fixed":
-            alpha = cfg.alpha_fixed
-        else: #cfg.alpha_rule == "sqrtlog":
-            alpha = cfg.c_sqrtlog * np.sqrt(np.log(p) / 20000)
-        
-        k = min(cfg.sig_shift, p)
-        if cfg.model_style == "sparse":
-            # beta*
-            s = min(cfg.sig_beta, p)
-        else :  # dense
-            s = p
-        beta_star = np.zeros(p)
-        beta_star[:s] = 1/np.sqrt(s)
-        b_pop_T = pop_ridge(beta_star, cfg.rho_T, cfg.mu_T, k, alpha, p, cfg.specified, rng, cfg.sigma_eps)
-        b_pop_S = pop_ridge(beta_star, cfg.rho_S, cfg.mu_S, k, alpha, p, cfg.specified, rng, cfg.sigma_eps)
-        pop_gap = np.linalg.norm(b_pop_S - b_pop_T)
+    # check some args
+    for params in (params_S, params_T):
+        if "rho" in params and abs(params["rho"]) >= 1:
+            raise ValueError("For gaussian_ar1, |rho| must be < 1 for SPD covariance.")
+
 
     for n in cfg.n_list:
-        if cfg.regime == "fixedp":
-            if cfg.alpha_rule == "fixed":
-                    alpha = cfg.alpha_fixed
-            else: #cfg.alpha_rule == "sqrtlog":
-                alpha = cfg.c_sqrtlog * np.sqrt(np.log(cfg.p_fixed) / n)
+        p = cfg.p_fixed if cfg.dimension_regime == "fixedp" else int(np.ceil(cfg.gamma * n))
+        k = min(cfg.sig_shift, p)  # shifted coordinates
+     
 
-        if cfg.regime == "highdim":
-            p = int(np.ceil(cfg.gamma * n))
-            if cfg.alpha_rule == "fixed":
-                    alpha = cfg.alpha_fixed
-            else: #cfg.alpha_rule == "sqrtlog":
-                alpha = cfg.c_sqrtlog * np.sqrt(np.log(p) / n)
+        alpha = get_alpha(n, p, cfg)
 
-            #have to do this for every p:
-            k = min(cfg.sig_shift, p)
-            if cfg.model_style == "sparse":
-                # beta*
-                s = min(cfg.sig_beta, p)
-            else :  # dense
-                s = p
-            beta_star = np.zeros(p)
-            beta_star[:s] = 1/np.sqrt(s)
-            
-            # population targets for this (n,p)
-            b_pop_T = pop_ridge(beta_star, cfg.rho_T, cfg.mu_T, k, alpha, p, cfg.specified, rng, cfg.sigma_eps)
-            b_pop_S = pop_ridge(beta_star, cfg.rho_S, cfg.mu_S, k, alpha, p, cfg.specified, rng, cfg.sigma_eps)
-           
+        # beta*
+        if cfg.model_style == "sparse":
+            s = min(cfg.sig_beta, p) # beta* supports
+        else :  # dense
+            s = p
 
-            
+        beta_star = np.zeros(p)
+        beta_star[:s] = 1/math.sqrt(s)
 
-            pop_gap = np.linalg.norm(b_pop_S - b_pop_T)
-            if pop_gap < 1e-6:
-                print("Warning: No shift detected.")
+        # population targets for this (n,p)
+        b_pop_T = pop_ridge_target(beta_star, alpha, p, cfg.specified, rng, cfg.noise_eps, k, fam_T, params_T, prefer_closed_form= True, verbose=True)
+        b_pop_S = pop_ridge_source(beta_star, alpha, p, cfg.specified, rng, cfg.noise_eps, k, fam_T, fam_S, params_T, params_S, prefer_closed_form= True, verbose=True)
 
-        # test set from target
-        S_A_T = ar1_cov(k, cfg.rho_T)
-        mu_vec_T = np.full(k, cfg.mu_T)
-        X_A_T = rng.multivariate_normal(mu_vec_T, S_A_T, size=cfg.n_test)
-        if p > k:
-            X_R_T = rng.standard_normal(size=(cfg.n_test, p-k))
-            X_Ttest = np.concatenate([X_A_T, X_R_T], axis=1)
-        else:
-            X_Ttest = X_A_T
+        pop_gap = float(np.linalg.norm(b_pop_S - b_pop_T))
+
+        if pop_gap < 1e-6:
+            print("Warning: No shift detected.")
+
+        # target test set (for risk) — use chosen target family
+        sample_func_T, lpdf_T = make_family(fam_T, **params_T)
+        X_Ttest = sample_func_T(cfg.n_test, p, rng)
 
         if cfg.specified == "well":
-            y_Ttest = X_Ttest @ beta_star + rng.normal(0, cfg.sigma_eps, size=cfg.n_test)
+            y_Ttest = X_Ttest @ beta_star + rng.normal(0, cfg.noise_eps, size=cfg.n_test)
         else: 
-            y_Ttest = mis_specficied_model(X_Ttest, beta_star, cfg.sigma_eps, rng, cfg.n_test)
-
-        d_unw, d_iw = [], []
-        r_unw, r_iw, r_pop = [], [], []
-        neffs = []
+            y_Ttest = mis_specficied_model(X_Ttest, beta_star, cfg.noise_eps, rng, cfg.n_test)
 
         oracle_risk = pred_mse(X_Ttest, y_Ttest, b_pop_T)
 
-        for _ in range(cfg.R):
+        d_unw, d_iw = [], []
+        r_unw, r_iw, r_pop = [], [], []
+
+        sample_func_S, lpdf_S = make_family(fam_S, **params_S)
+
+        # for plotting distributions:
+        X_S_for_plot = None
+        X_T_for_plot = None
+        W_for_plot   = None
+
+        for r in range(cfg.R):
             
             # source draws
-            S_A = ar1_cov(k, cfg.rho_S)
-            mu_vec_S = np.full(k, cfg.mu_S)
-            X_A_S = rng.multivariate_normal(mu_vec_S, S_A, size=n)
-            if p > k:
-                X_R_S = rng.standard_normal(size=(n, p-k))
-                X_S = np.concatenate([X_A_S, X_R_S], axis=1)
-            else:
-                X_S = X_A_S
+            X_S_A = sample_func_S(n, k, rng)      # (n, k)
+            X_S_B = sample_func_T(n, p-k, rng)          # (n, p-k)
+            X_S = np.concatenate([X_S_A, X_S_B], axis=1)  # (n, p)
 
             if cfg.specified == "well":
-                y_S = X_S @ beta_star + rng.normal(0, cfg.sigma_eps, size=n)
+                y_S = X_S @ beta_star + rng.normal(0, cfg.noise_eps, size=n)
             else:
-                y_S = mis_specficied_model(X_S, beta_star, cfg.sigma_eps, rng, n)
-            
-            # X_S_ = np.c_[np.ones(n), X_S]          # (n, p+1)
-            # X_Ttest_ = np.c_[np.ones(cfg.n_test), X_Ttest]
-            # p_plus = X_S_.shape[1]
-            
-            # weights on shifted block or full
-            if cfg.use_subset_weights:
-                logpT = logpdf(X_A_S, np.zeros(k)+cfg.mu_T, ar1_cov(k, cfg.rho_T))
-                logpS = logpdf(X_A_S, np.zeros(k)+cfg.mu_S, ar1_cov(k, cfg.rho_S))
-            else:
-                # full densities (heavier variance)
-                S_full = np.block([[ar1_cov(k, cfg.rho_S), np.zeros((k, p-k))],
-                                   [np.zeros((p-k, k)), np.eye(p-k)]])
-                T_full = np.block([[ar1_cov(k, cfg.rho_T), np.zeros((k, p-k))],
-                                   [np.zeros((p-k, k)), np.eye(p-k)]])
-                logpT = logpdf(X_S, np.zeros(p), T_full)
-                logpS = logpdf(X_S, np.zeros(p), S_full)
+                y_S = mis_specficied_model(X_S, beta_star, cfg.noise_eps, rng, n)
 
-         
-            logw = logpT - logpS
+
+            # weights on shifted block or full
+            if cfg.use_subset_weights and k < p:
+                X_shiftfeatures = X_S[:, :k]  # (n, k)
+            else:
+                X_shiftfeatures = X_S 
+                      # (n, p)
+
+            logw = lpdf_T(X_shiftfeatures) - lpdf_S(X_shiftfeatures)
+            #logw = np.clip(logw, -700, 700)
             w = np.exp(logw)
-            # if cfg.clip_q is not None:
-            #     cap = np.quantile(w, cfg.clip_q)        # e.g., 0.90–0.95
-            #     w = np.minimum(w, cap)
-            w = w / (w.mean() + 1e-12)
+            w = treat_weights(w, cfg)
             sum_w = w.sum()
 
-            # # temper and clip
-            # if cfg.tau < 1.0:
-            #     w = w**cfg.tau
-            # if cfg.clip_q is not None:
-            #     cap = np.quantile(w, cfg.clip_q)
-            #     w = np.minimum(w, cap)
-            # if cfg.normalize_w:
-            #     w /= (w.mean() + 1e-12)
 
-            #neff = n_eff(w); neffs.append(neff)
-            Pen = 2*alpha * np.eye(p)
-            # Pen[0, 0] = 0.0
+            # ridge fits
+            penalty = 2*alpha * np.eye(p)
+            # penalty[0, 0] = 0.0
 
             # ridge via normal equations (aligned with population form)
             XtX = (X_S.T @ X_S) / n
             Xty = (X_S.T @ y_S) / n
-            b_unw = solve(XtX + Pen, Xty)
+            b_unw = solve(XtX + penalty, Xty)
 
             XtWX = (X_S.T * w) @ X_S / sum_w
             XtWy = (X_S.T * w) @ y_S / sum_w
-            b_iw = solve(XtWX + Pen, XtWy)
+            b_iw = solve(XtWX + penalty, XtWy)
 
             # b_unw = b_unw_full[1:]
             # b_iw  = b_iw_full[1:]
 
             # metrics
-            d_unw.append(np.linalg.norm(np.abs(b_unw - b_pop_T)))
-            d_iw.append(np.linalg.norm(np.abs(b_iw - b_pop_T)))
-            r_unw.append((pred_mse(X_Ttest, y_Ttest, b_unw) - oracle_risk)/np.sqrt(p))
-            r_iw.append((pred_mse(X_Ttest, y_Ttest, b_iw) - oracle_risk)/np.sqrt(p))
-            r_pop.append((pred_mse(X_Ttest, y_Ttest, b_pop_T) - oracle_risk)/np.sqrt(p))
+            d_unw.append(np.linalg.norm(b_unw - b_pop_T))
+            d_iw.append(np.linalg.norm(b_iw - b_pop_T))
+            r_unw.append((pred_mse(X_Ttest, y_Ttest, b_unw) - oracle_risk)/p)
+            r_iw.append((pred_mse(X_Ttest, y_Ttest, b_iw) - oracle_risk)/p)
+            r_pop.append((pred_mse(X_Ttest, y_Ttest, b_pop_T) - oracle_risk)/p)
+
+            #save one draw for plotting distributions
+            if r == 0 and n == cfg.n_list[-1]:
+                X_S_for_plot = X_S.copy()
+                X_T_for_plot = X_Ttest[:n].copy()
+                W_for_plot   = w.copy()
+                plot_dists.append({
+                    "plot_dist":{
+                        "X_S": X_S_for_plot[:,:2],
+                        "X_T": X_T_for_plot[:,:2],
+                        "W": W_for_plot
+                    }
+                })
 
         results.append({
             "n": n, "p": p, "k": k,
-            # "mean_neff": float(np.mean(neffs)),
-            "pop_gap": float(pop_gap),
+            "alpha": alpha,
+            "pop_gap": pop_gap,
             "dist_unw": (float(np.mean(d_unw)), float(np.std(d_unw, ddof=1)/np.sqrt(cfg.R))),
             "dist_iw":  (float(np.mean(d_iw)), float(np.std(d_iw, ddof=1)/np.sqrt(cfg.R))),
             "risk_unw": (float(np.mean(r_unw)), float(np.std(r_unw, ddof=1)/np.sqrt(cfg.R))),
             "risk_iw":  (float(np.mean(r_iw)), float(np.std(r_iw, ddof=1)/np.sqrt(cfg.R))),
-            "risk_pop": (float(np.mean(r_pop)), float(np.std(r_pop, ddof=1)/np.sqrt(cfg.R))),
+            "risk_pop": (float(np.mean(r_pop)), float(np.std(r_pop, ddof=1)/np.sqrt(cfg.R)))
         })
-    return results
-def plot_all(res):
-    nvals = np.array([r["n"] for r in res])
-    # distances
-    mu_u = np.array([r["dist_unw"][0] for r in res])
-    se_u = np.array([r["dist_unw"][1] for r in res])
-    mu_w = np.array([r["dist_iw"][0] for r in res])
-    se_w = np.array([r["dist_iw"][1] for r in res])
-    cvals = np.array([r["pop_gap"] for r in res])
 
-    plt.figure()
-    plt.plot(nvals, mu_u, marker='o', label='Ridge (unweighted)')
-    plt.fill_between(nvals, mu_u-se_u, mu_u+se_u, alpha=0.2)
-    # plt.plot(nvals, mu_w, marker='o', label='IW-Ridge (tempered/clip)')
-    plt.plot(nvals, mu_w, marker='o', label='IW-Ridge')
-    plt.fill_between(nvals, mu_w-se_w, mu_w+se_w, alpha=0.2)
-    # plt.plot(nvals, cvals, '--', label='Population gap')
-    plt.plot(nvals, cvals, '--', label='Population gap '+ r'$||β_S^{pop}-β_T^{pop}||$')
-    plt.xlabel('n'); plt.ylabel(r'$||\hat\beta-\beta^{pop}_{T}||_2$')
-    plt.title('Parameter distance in high dimension')
-    plt.legend(); plt.tight_layout(); plt.show()
+    return results, plot_dists
 
-    # risks on target
-    ru = np.array([r["risk_unw"][0] for r in res])
-    su = np.array([r["risk_unw"][1] for r in res])
-    rw = np.array([r["risk_iw"][0] for r in res])
-    sw = np.array([r["risk_iw"][1] for r in res])
-    rp = np.array([r["risk_pop"][0] for r in res])
-
-    plt.figure()
-    plt.plot(nvals, ru, marker='o', label='Ridge risk (unweighted)')
-    plt.fill_between(nvals, ru-su, ru+su, alpha=0.2)
-    plt.plot(nvals, rw, marker='o', label='IW-Ridge risk')
-    plt.fill_between(nvals, rw-sw, rw+sw, alpha=0.2)
-    plt.plot(nvals, rp, '--', label='Risk at population ridge (target)')
-    plt.xlabel('n'); plt.ylabel('Target MSE')
-    plt.title('Prediction risk on target')
-    plt.legend(); plt.tight_layout(); plt.show()
-
-    # n_eff
-    # ne = np.array([r["mean_neff"] for r in res])
-    # plt.figure()
-    # plt.plot(nvals, ne, marker='o')
-    # plt.xlabel('n'); plt.ylabel('Mean n_eff')
-    # plt.title('Effective sample size under weighting')
-    # plt.tight_layout(); plt.show()
+# ---------- Main ----------
 
 if __name__ == "__main__":
     cfg = Cfg(
-        regime="highdim",       
-        gamma=1.5,
+        # simulation controls
+        dimension_regime="highdim",
+        p_fixed =20,
+        gamma = 1.5,
+        n_list = (50, 100, 150, 200, 300, 500, 1000, 1500, 2000),
+        R = 500,
+        seed = 11,
+
+        # model controls
         specified="mis",
         model_style="sparse",
         sig_shift=10,
-        sig_beta=3,
-        rho_S=0.0,
-        rho_T=0.0,
-        mu_S=-2.0,
-        mu_T=1.0,
-        sigma_eps=1.0,
-        # key knobs:
-        tau=1.0,                 # tempering lowers variance
-        clip_q=None,             # clip heavy tails
-        alpha_rule="sqrtlog",       # tune α to n_eff
-        #c_neff=0.8,
-        seed=12
+        sig_beta=5,
+        noise_eps=1.0,
+        alpha_rule = "sqrtlog",
+        c_sqrtlog = 1,
+
+        # distribution controls
+        family_S = "gaussian_indep", params_S={"mu": -1.0, "rho": 0},
+        family_T = "gaussian_indep", params_T={"mu":  1.5, "rho": 0},
+        # family_T = "laplace_indep", params_S={"mu": 2.0, "b": 4},
+        # family_S = "gaussian_indep", params_T={"mu":  1.0, "rho": 0},
+
+        # weighting controls
+        use_subset_weights=True,
+        normalize_weights=True,
+        stabilize_weights=False,
+
+        # output
+        out_dir = "iw_ridge"
     )
-    res = run(cfg)
+    res, plot_dists = run(cfg)
     for r in res:
-        print(f"n={r['n']:4d}, p={r['p']:4d}, "#n_eff≈{r['mean_neff']:.1f}, "
+        print(f"n={r['n']:4d}, p={r['p']:4d},"
               f"dist_unw={r['dist_unw'][0]:.3f}, dist_iw={r['dist_iw'][0]:.3f}, "
               f"risk_unw={r['risk_unw'][0]:.3f}, risk_iw={r['risk_iw'][0]:.3f}")
-    plot_all(res)
+        
+    present_results(cfg, res, plot_dists, outdir=cfg.out_dir)
+    print(f"Results and plots saved at: {cfg.out_dir}/index.html")
